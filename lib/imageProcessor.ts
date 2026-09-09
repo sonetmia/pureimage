@@ -1,32 +1,65 @@
-import { processJpeg } from './jpegProcessor'
-import { processPng } from './pngProcessor'
-import { processWebp } from './webpProcessor'
-import { MetadataReport, ProcessingResult } from '../types'
+import { processJpeg, parseJpegSegments, identifyMetadataSegments } from './processors/jpegProcessor'
+import { processPng, parsePngChunks, identifyPngMetadata } from './processors/pngProcessor'
+import { processWebp, parseWebpChunks, identifyWebpMetadata } from './processors/webpProcessor'
+import type { MetadataReport, ProcessingResult } from './types'
 
 export async function stripMetadata(
   file: File,
   options: { jpegQuality?: number } = {}
-): Promise<ProcessingResult> {
-  const jpegQuality = options.jpegQuality ?? 1.0
-
-  let result: { blob: Blob; reencoded: boolean; metadata: MetadataReport }
+): Promise<Blob> {
+  const jpegQuality = options.jpegQuality ?? 1
 
   switch (file.type) {
     case 'image/jpeg':
-      result = await processJpeg(file, jpegQuality)
-      break
+      return (await processJpeg(file, jpegQuality)).blob
     case 'image/png':
-      result = await processPng(file)
-      break
+      return (await processPng(file)).blob
     case 'image/webp':
-      result = await processWebp(file)
+      return (await processWebp(file)).blob
+    default:
+      throw new Error(`Unsupported file type: ${file.type}`)
+  }
+}
+
+export async function processImage(
+  file: File,
+  options: { jpegQuality?: number } = {}
+): Promise<ProcessingResult> {
+  const originalMetadata = await scanMetadata(file)
+  const jpegQuality = options.jpegQuality ?? 1
+
+  let result: { blob: Blob; reencoded: boolean }
+
+  switch (file.type) {
+    case 'image/jpeg': {
+      const processed = await processJpeg(file, jpegQuality)
+      result = { blob: processed.blob, reencoded: processed.reencoded }
       break
+    }
+    case 'image/png': {
+      const processed = await processPng(file)
+      result = { blob: processed.blob, reencoded: processed.reencoded }
+      break
+    }
+    case 'image/webp': {
+      const processed = await processWebp(file)
+      result = { blob: processed.blob, reencoded: processed.reencoded }
+      break
+    }
     default:
       throw new Error(`Unsupported file type: ${file.type}`)
   }
 
   const originalDimensions = await getImageDimensions(file)
   const cleanedDimensions = await getImageDimensions(result.blob)
+  const metadataAfter = await scanMetadata(result.blob)
+
+  if (
+    originalDimensions.width !== cleanedDimensions.width ||
+    originalDimensions.height !== cleanedDimensions.height
+  ) {
+    throw new Error('Image dimensions changed during processing. The cleaned image was not accepted.')
+  }
 
   return {
     success: true,
@@ -36,59 +69,50 @@ export async function stripMetadata(
     cleanedSize: result.blob.size,
     originalDimensions,
     cleanedDimensions,
-    format: file.type,
-    metadataBefore: result.metadata,
-    metadataAfter: {
-      exif: false,
-      xmp: false,
-      c2pa: false,
-      gps: false,
-    },
+    format: result.blob.type || file.type,
+    metadataBefore: originalMetadata,
+    metadataAfter,
     reencoded: result.reencoded,
   }
 }
 
-async function getImageDimensions(blob: Blob): Promise<{ width: number; height: number }> {
-  return new Promise((resolve, reject) => {
-    const img = new Image()
-    img.onload = () => {
-      resolve({ width: img.width, height: img.height })
-      URL.revokeObjectURL(img.src)
-    }
-    img.onerror = () => {
-      reject(new Error('Failed to load image for dimension check'))
-      URL.revokeObjectURL(img.src)
-    }
-    img.src = URL.createObjectURL(blob)
-  })
+export async function scanMetadata(blob: Blob): Promise<MetadataReport> {
+  const arrayBuffer = await blob.arrayBuffer()
+  const data = new Uint8Array(arrayBuffer)
+  const type = blob.type
+
+  switch (type) {
+    case 'image/jpeg':
+      return identifyMetadataSegments(parseJpegSegments(data))
+    case 'image/png':
+      return identifyPngMetadata(parsePngChunks(data))
+    case 'image/webp':
+      return identifyWebpMetadata(parseWebpChunks(data))
+    default:
+      return { exif: false, xmp: false, c2pa: false, gps: false }
+  }
 }
 
-export async function scanMetadata(file: File): Promise<MetadataReport> {
-  const arrayBuffer = await file.arrayBuffer()
-  const data = new Uint8Array(arrayBuffer)
-
-  switch (file.type) {
-    case 'image/jpeg': {
-      const { parseJpegSegments, identifyMetadataSegments } = await import('./jpegProcessor')
-      const segments = parseJpegSegments(data)
-      return identifyMetadataSegments(segments)
-    }
-    case 'image/png': {
-      const { parsePngChunks, identifyPngMetadata } = await import('./pngProcessor')
-      const chunks = parsePngChunks(data)
-      return identifyPngMetadata(chunks)
-    }
-    case 'image/webp': {
-      const { parseWebpChunks, identifyWebpMetadata } = await import('./webpProcessor')
-      const chunks = parseWebpChunks(data)
-      return identifyWebpMetadata(chunks)
-    }
-    default:
-      return {
-        exif: false,
-        xmp: false,
-        c2pa: false,
-        gps: false,
-      }
+async function getImageDimensions(blob: Blob): Promise<{ width: number; height: number }> {
+  if (typeof createImageBitmap === 'function') {
+    const bitmap = await createImageBitmap(blob)
+    const dimensions = { width: bitmap.width, height: bitmap.height }
+    bitmap.close()
+    return dimensions
   }
+
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob)
+    const img = new Image()
+    img.onload = () => {
+      const dimensions = { width: img.naturalWidth, height: img.naturalHeight }
+      URL.revokeObjectURL(url)
+      resolve(dimensions)
+    }
+    img.onerror = () => {
+      URL.revokeObjectURL(url)
+      reject(new Error('Failed to load image for dimension check'))
+    }
+    img.src = url
+  })
 }
